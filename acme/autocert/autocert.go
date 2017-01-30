@@ -72,6 +72,19 @@ func defaultHostPolicy(context.Context, string) error {
 	return nil
 }
 
+// DnsUpdater makes it possible to use dns-01 challenge type.
+// If a DnsUpdater is set on the Manager, dns-01 challenge type will be preferred.
+type DnsUpdater interface {
+	// Called by Manager to add the given token in a TXT record on the given uri.
+	// Should not return before the record is set and propagated in dns, ready for CA to verify.
+	AddValidationRecord(ctx context.Context, uri, token string) error
+
+	// Called by Manager in separate goroutine, to remove the given token from TXT record on the uri
+	// when the CA has verified the challenge. Not required for the validation to succeed, just to
+	// clean up the TXT record for the domain.
+	DeleteValidationRecord(ctx context.Context, uri, token string) error
+}
+
 // Manager is a stateful certificate manager built on top of acme.Client.
 // It obtains and refreshes certificates automatically,
 // as well as providing them to a TLS server via tls.Config.
@@ -146,6 +159,9 @@ type Manager struct {
 	// If false, a default is used. Currently the default
 	// is EC-based keys using the P-256 curve.
 	ForceRSA bool
+
+	// DnsUpdater makes the Manager use dns-01 challenge type if it is offered by CA.
+	DnsUpdater DnsUpdater
 
 	clientMu sync.Mutex
 	client   *acme.Client // initialized by acmeClient method
@@ -462,10 +478,14 @@ func (m *Manager) verify(ctx context.Context, domain string) error {
 		return nil
 	}
 
-	// pick a challenge: prefer tls-sni-02 over tls-sni-01
+	// pick a challenge: prefer dns-01 if DnsUpdater is provided, otherwise tls-sni-02 over tls-sni-01
 	// TODO: consider authz.Combinations
 	var chal *acme.Challenge
 	for _, c := range authz.Challenges {
+		if m.DnsUpdater != nil && c.Type == "dns-01" {
+			chal = c
+			break
+		}
 		if c.Type == "tls-sni-02" {
 			chal = c
 			break
@@ -480,26 +500,41 @@ func (m *Manager) verify(ctx context.Context, domain string) error {
 
 	// create a token cert for the challenge response
 	var (
-		cert tls.Certificate
-		name string
+		cert  tls.Certificate
+		name  string
+		token string // for dns validation
 	)
 	switch chal.Type {
 	case "tls-sni-01":
 		cert, name, err = client.TLSSNI01ChallengeCert(chal.Token)
 	case "tls-sni-02":
 		cert, name, err = client.TLSSNI02ChallengeCert(chal.Token)
+	case "dns-01":
+		token, err = client.DNS01ChallengeRecord(chal.Token)
 	default:
 		err = fmt.Errorf("acme/autocert: unknown challenge type %q", chal.Type)
 	}
 	if err != nil {
 		return err
 	}
-	m.putTokenCert(name, &cert)
-	defer func() {
-		// verification has ended at this point
-		// don't need token cert anymore
-		go m.deleteTokenCert(name)
-	}()
+	if name != "" { // cert based validation
+		m.putTokenCert(name, &cert)
+		defer func() {
+			// verification has ended at this point
+			// don't need token cert anymore
+			go m.deleteTokenCert(name)
+		}()
+
+	} else { // dns based validation
+		err = m.DnsUpdater.AddValidationRecord(ctx, "_acme-challenge."+domain, token)
+		if err != nil {
+			return fmt.Errorf("acme/autocert: failed to add dns challenge record: %s", err)
+		}
+		defer func() {
+			// pass provided context, since it is not cancelled anywhere.
+			go m.DnsUpdater.DeleteValidationRecord(ctx, "_acme-challenge."+domain, token)
+		}()
+	}
 
 	// ready to fulfill the challenge
 	if _, err := client.Accept(ctx, chal); err != nil {
